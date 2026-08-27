@@ -1,12 +1,17 @@
-# Android-GitSync
+# GitSync
 
-A small Android app that clones a GitHub repository to a phone folder, watches file changes, pushes changes, and periodically pulls from GitHub.
+GitHub repository ↔ one Android phone folder two-way synchronization.
 
-## GitHub upload
-Upload the contents of this folder to a GitHub repository. Keep the repository private, especially if you plan to use personal access tokens.
+- Saves repository URL and folder path between app launches.
+- Encrypts the saved GitHub token with Android Keystore.
+- Performs an immediate sync when Start Sync is pressed.
+- Checks again every 2 minutes while the foreground sync service is running.
+- Uses the GitHub Git database REST API instead of an embedded Git command line.
+- Local changes are pushed to the repository; remote-only changes are pulled to the phone.
+- When both sides changed the same path, the local phone version wins, matching the one-device use case.
 
-## GitHub Actions
-The workflow at `.github/workflows/build-apk.yml` builds a debug APK and stores it as the `GitSync-APK` artifact.
+## First run
 
-## Important
-Do not commit a GitHub token into the repository. This project currently accepts the token through the app UI; use a least-privileged fine-grained token and avoid sharing APK screenshots/logs that expose it.
+Use an empty or disposable test folder for the first sync. The repository should already contain the files you want on the phone. The app uses the repository's default branch.
+
+The token must have Contents read/write permission for the selected repository.

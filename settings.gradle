@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Android-GitSync"
-include ':app'
+rootProject.name = "GitSync"
+include(":app")

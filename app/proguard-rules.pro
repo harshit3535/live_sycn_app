@@ -1,1 +1,1 @@
-# Project-specific ProGuard/R8 rules.
+# GitSync currently does not require custom ProGuard/R8 rules.
