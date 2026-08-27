@@ -7,66 +7,237 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.FileObserver
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import androidx.core.app.NotificationCompat
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class SyncService : Service() {
+
     private lateinit var gitManager: GitManager
-    private val handler = Handler(Looper.getMainLooper())
-    private var pullRunnable: Runnable? = null
-    private var fileObserver: FileObserver? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val folder = intent?.getStringExtra("FOLDER_PATH") ?: return START_NOT_STICKY
-        val url = intent.getStringExtra("REPO_URL") ?: return START_NOT_STICKY
-        val token = intent.getStringExtra("TOKEN") ?: return START_NOT_STICKY
+    private var fileObservers = mutableListOf<FileObserver>()
 
-        val repoDir = File(folder)
-        if (!repoDir.exists()) repoDir.mkdirs()
-        gitManager = GitManager(repoDir, token)
-        if (!File(repoDir, ".git").exists()) gitManager.cloneRepo(url)
+    private val executor = Executors.newSingleThreadExecutor()
 
-        startForeground(1001, createNotification("Sync Active"))
-        startFileObserver(folder)
-        startPeriodicPull()
+    private val scheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor()
+
+    private var folderPath: String = ""
+
+    override fun onCreate() {
+        super.onCreate()
+
+        startForeground(
+            1001,
+            createNotification("Starting GitHub Sync...")
+        )
+    }
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
+        val folder = intent?.getStringExtra("FOLDER_PATH")
+        val url = intent?.getStringExtra("REPO_URL")
+        val token = intent?.getStringExtra("TOKEN")
+
+        if (folder.isNullOrBlank() ||
+            url.isNullOrBlank() ||
+            token.isNullOrBlank()
+        ) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        folderPath = folder
+
+        executor.execute {
+
+            try {
+
+                val repoDir = File(folderPath)
+
+                if (!repoDir.exists()) {
+                    repoDir.mkdirs()
+                }
+
+                gitManager = GitManager(
+                    repoDir,
+                    token
+                )
+
+                if (!gitManager.isRepository()) {
+
+                    val cloned = gitManager.cloneRepo(url)
+
+                    if (!cloned) {
+                        updateNotification("Clone failed")
+                        stopSelf()
+                        return@execute
+                    }
+                }
+
+                updateNotification("Sync Active")
+
+                startFileObservers(repoDir)
+
+                startPeriodicPull()
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+                updateNotification("Sync Error")
+            }
+        }
+
         return START_STICKY
     }
 
-    private fun startFileObserver(path: String) {
-        fileObserver?.stopWatching()
-        fileObserver = object : FileObserver(path, FileObserver.CLOSE_WRITE or FileObserver.CREATE or FileObserver.MOVED_TO) {
-            override fun onEvent(event: Int, relativePath: String?) {
-                handler.postDelayed({ if (::gitManager.isInitialized) gitManager.push() }, 1000)
+    private fun startFileObservers(root: File) {
+
+        stopFileObservers()
+
+        observeDirectory(root)
+
+        root.walkTopDown()
+            .filter { it.isDirectory }
+            .forEach { directory ->
+
+                if (directory.absolutePath != root.absolutePath) {
+                    observeDirectory(directory)
+                }
             }
+    }
+
+    private fun observeDirectory(directory: File) {
+
+        try {
+
+            val observer = object : FileObserver(directory.absolutePath) {
+
+                override fun onEvent(
+                    event: Int,
+                    path: String?
+                ) {
+
+                    val importantEvents =
+                        FileObserver.CREATE or
+                        FileObserver.CLOSE_WRITE or
+                        FileObserver.MOVED_TO or
+                        FileObserver.MOVED_FROM or
+                        FileObserver.DELETE
+
+                    if ((event and importantEvents) == 0) {
+                        return
+                    }
+
+                    executor.execute {
+
+                        try {
+
+                            if (::gitManager.isInitialized) {
+                                updateNotification("Uploading changes...")
+                                gitManager.push()
+                                updateNotification("Sync Active")
+                            }
+
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            }
+
+            observer.startWatching()
+
+            fileObservers.add(observer)
+
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        fileObserver?.startWatching()
     }
 
     private fun startPeriodicPull() {
-        pullRunnable?.let { handler.removeCallbacks(it) }
-        pullRunnable = object : Runnable {
-            override fun run() {
-                if (::gitManager.isInitialized) gitManager.pull()
-                handler.postDelayed(this, 120000)
-            }
-        }
-        handler.postDelayed(pullRunnable!!, 5000)
+
+        scheduler.scheduleWithFixedDelay(
+
+            {
+                executor.execute {
+
+                    try {
+
+                        if (::gitManager.isInitialized) {
+
+                            updateNotification("Checking GitHub...")
+
+                            gitManager.pull()
+
+                            updateNotification("Sync Active")
+                        }
+
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        updateNotification("Pull failed")
+                    }
+                }
+            },
+
+            5,
+            120,
+            TimeUnit.SECONDS
+        )
     }
 
-    private fun createNotification(text: String): Notification {
+    private fun stopFileObservers() {
+
+        for (observer in fileObservers) {
+            try {
+                observer.stopWatching()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        fileObservers.clear()
+    }
+
+    private fun updateNotification(text: String) {
+
+        val notificationManager =
+            getSystemService(NotificationManager::class.java)
+
+        notificationManager.notify(
+            1001,
+            createNotification(text)
+        )
+    }
+
+    private fun createNotification(
+        text: String
+    ): Notification {
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             val channel = NotificationChannel(
                 "GitSync",
                 "GitHub Sync",
                 NotificationManager.IMPORTANCE_LOW
             )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(channel)
         }
-        return NotificationCompat.Builder(this, "GitSync")
-            .setContentTitle("🔄 GitHub Sync")
+
+        return NotificationCompat.Builder(
+            this,
+            "GitSync"
+        )
+            .setContentTitle("GitSync")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setOngoing(true)
@@ -74,11 +245,16 @@ class SyncService : Service() {
     }
 
     override fun onDestroy() {
-        fileObserver?.stopWatching()
-        fileObserver = null
-        handler.removeCallbacksAndMessages(null)
+
+        stopFileObservers()
+
+        scheduler.shutdownNow()
+        executor.shutdownNow()
+
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
 }
