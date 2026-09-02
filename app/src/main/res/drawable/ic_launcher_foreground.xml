@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple two-way sync arrows in the app accent green -->
+    <path
+        android:fillColor="#3DDC97"
+        android:pathData="M32,38 L32,30 C32,27 34,25 37,25 L66,25 L66,17 L82,30 L66,43 L66,35 L40,35 C39,35 38,36 38,37 L38,52 L32,52 Z" />
+    <path
+        android:fillColor="#5B8CFF"
+        android:pathData="M76,70 L76,78 C76,81 74,83 71,83 L42,83 L42,91 L26,78 L42,65 L42,73 L68,73 C69,73 70,72 70,71 L70,56 L76,56 Z" />
+</vector>

@@ -3,118 +3,266 @@ package com.example.gitsync
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import java.io.File
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * One foreground service manages ALL running profiles at once (up to
+ * [ProfileStore.MAX_RUNNING]). Each profile gets its own coroutine loop,
+ * its own notification, and its own entry in [SyncStatusRegistry] — they
+ * never share status/progress/log. Stopping one profile never affects
+ * the others; the service itself only stops once none are running.
+ */
 class SyncService : Service() {
 
-    private lateinit var prefs: AppPrefs
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val loopJobs = ConcurrentHashMap<String, Job>()
+    private val triggerChannels = ConcurrentHashMap<String, Channel<Unit>>()
 
-    private val executor = Executors.newSingleThreadExecutor()
-    private val scheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(1)
-    private var scheduled: ScheduledFuture<*>? = null
-    private val running = AtomicBoolean(false)
+    private lateinit var store: ProfileStore
+    private lateinit var notificationManager: NotificationManager
 
     override fun onCreate() {
         super.onCreate()
-        prefs = AppPrefs(this)
-        createNotificationChannel()
-        startForeground(1001, notification("Starting..."))
+        store = ProfileStore(this)
+        SyncStatusRegistry.init(this)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        createChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        runSyncNow()
+        val profileId = intent?.getStringExtra(EXTRA_PROFILE_ID)
+        when (intent?.action) {
+            ACTION_START -> {
+                ensureForeground()
+                if (profileId != null) startProfileLoop(profileId)
+            }
+            ACTION_STOP -> {
+                if (profileId != null) stopProfileLoop(profileId)
+            }
+            ACTION_TRIGGER_NOW -> {
+                ensureForeground()
+                if (profileId != null) triggerChannels[profileId]?.trySend(Unit)
+            }
+            else -> ensureForeground()
+        }
         return START_STICKY
     }
 
-    private fun runSyncNow() {
-        if (!running.compareAndSet(false, true)) return
+    private fun ensureForeground() {
+        startForeground(SUMMARY_NOTIFICATION_ID, buildSummaryNotification())
+    }
 
-        executor.execute {
-            try {
-                val repoUrl = prefs.repo()
-                val token = prefs.token()
-                val folderPath = prefs.folder()
+    private fun startProfileLoop(profileId: String) {
+        if (loopJobs[profileId]?.isActive == true) return // already running
 
-                if (repoUrl.isBlank() || token.isBlank() || folderPath.isBlank()) {
-                    updateStatus("❌ Settings missing")
-                    return@execute
-                }
+        store.markRunning(profileId)
+        val status = SyncStatusRegistry.forProfile(profileId)
+        status.setRunning(true)
 
-                val folder = File(folderPath)
-                if (!folder.exists() && !folder.mkdirs()) {
-                    updateStatus("❌ Cannot create folder")
-                    return@execute
-                }
+        val channel = Channel<Unit>(Channel.CONFLATED)
+        triggerChannels[profileId] = channel
 
-                updateStatus("🔄 Checking GitHub...")
+        val job = scope.launch {
+            while (isActive) {
+                val profile = store.get(profileId)
+                if (profile == null) break // profile was deleted while running
 
-                val engine = GitHubSyncEngine(token)
-                val result = engine.sync(repoUrl, folder, prefs)
+                runSyncSafely(profile, status)
 
-                updateStatus(result)
-                ensureSchedule()
-            } catch (e: Exception) {
-                e.printStackTrace()
-                updateStatus("❌ ${e.message ?: "Sync failed"}")
-                ensureSchedule()
-            } finally {
-                running.set(false)
+                val interval = store.get(profileId)?.interval ?: profile.interval
+                val nextAt = System.currentTimeMillis() + interval.seconds * 1000L
+                status.markCheck(nextAt)
+                updateProfileNotification(profile, "Next check in ${interval.seconds}s", 0, false)
+
+                withTimeoutOrNull(interval.seconds * 1000L) { channel.receive() }
             }
+            // Loop ended (profile deleted) — clean up.
+            cleanupAfterLoopEnd(profileId)
+        }
+        loopJobs[profileId] = job
+        updateSummaryNotification()
+    }
+
+    private fun cleanupAfterLoopEnd(profileId: String) {
+        loopJobs.remove(profileId)
+        triggerChannels.remove(profileId)
+        SyncStatusRegistry.forProfile(profileId).setRunning(false)
+        notificationManager.cancel(profileNotificationId(profileId))
+        updateSummaryNotification()
+        stopServiceIfIdle()
+    }
+
+    private fun stopProfileLoop(profileId: String) {
+        loopJobs[profileId]?.cancel()
+        loopJobs.remove(profileId)
+        triggerChannels.remove(profileId)
+        store.markStopped(profileId)
+        SyncStatusRegistry.forProfile(profileId).setRunning(false)
+        notificationManager.cancel(profileNotificationId(profileId))
+        updateSummaryNotification()
+        stopServiceIfIdle()
+    }
+
+    private fun stopServiceIfIdle() {
+        if (loopJobs.isEmpty()) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
     }
 
-    private fun ensureSchedule() {
-        if (scheduled?.isCancelled == false && scheduled?.isDone == false) return
+    private fun runSyncSafely(profile: SyncProfile, status: ProfileStatus) {
+        try {
+            if (!profile.isConfigured()) {
+                status.addLog(LogType.ERROR, "Settings incomplete — check repo URL, token and folder")
+                return
+            }
+            status.setPhase(SyncPhase.CHECKING, "Checking for changes…")
+            updateProfileNotification(profile, "Checking for changes…", 0, false)
 
-        scheduled = scheduler.scheduleAtFixedRate(
-            { runSyncNow() },
-            120,
-            120,
-            TimeUnit.SECONDS
-        )
-    }
-
-    private fun updateStatus(text: String) {
-        prefs.setStatus(text)
-        getSystemService(NotificationManager::class.java).notify(1001, notification(text))
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "GitSync",
-                "GitSync",
-                NotificationManager.IMPORTANCE_LOW
+            val engine = GitHubSyncEngine(
+                profile = profile,
+                manifestDir = filesDir,
+                onBranchResolved = { branch -> store.save(profile.copy(branch = branch)) }
             )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+            val changed = engine.syncOnce(
+                onProgress = { phase, percent, text ->
+                    status.setPhase(phase, text)
+                    status.setProgress(percent)
+                    updateProfileNotification(profile, text, percent, phase == SyncPhase.PUSHING || phase == SyncPhase.PULLING)
+                },
+                onFileLogged = { type, path -> status.addLog(type, path) }
+            )
+
+            if (changed) {
+                status.markSyncCompleted(System.currentTimeMillis())
+            }
+        } catch (e: Exception) {
+            status.setPhase(SyncPhase.ERROR, e.message ?: "Sync failed")
+            status.addLog(LogType.ERROR, e.message ?: "Unknown error")
+        } finally {
+            status.setPhase(SyncPhase.IDLE, "Idle")
+            status.setProgress(0)
         }
     }
 
-    private fun notification(text: String): Notification {
-        return NotificationCompat.Builder(this, "GitSync")
+    // --- Notifications -----------------------------------------------------
+
+    private fun buildSummaryNotification(): Notification {
+        val count = loopJobs.size
+        val text = if (count == 0) "Idle" else "$count profile(s) syncing"
+        val openIntent = Intent(this, MainActivity::class.java)
+        val openPending = PendingIntent.getActivity(
+            this, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("GitSync")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_popup_sync)
+            .setContentIntent(openPending)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
     }
 
+    private fun updateSummaryNotification() {
+        notificationManager.notify(SUMMARY_NOTIFICATION_ID, buildSummaryNotification())
+    }
+
+    private fun buildProfileNotification(profile: SyncProfile, text: String, percent: Int, showProgress: Boolean): Notification {
+        val stopIntent = Intent(this, SyncService::class.java).apply {
+            action = ACTION_STOP
+            putExtra(EXTRA_PROFILE_ID, profile.id)
+        }
+        val stopPending = PendingIntent.getService(
+            this, profile.id.hashCode(), stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val openIntent = Intent(this, MainActivity::class.java)
+        val openPending = PendingIntent.getActivity(
+            this, profile.id.hashCode(), openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle(profile.name)
+            .setContentText(text)
+            .setContentIntent(openPending)
+            .addAction(0, "Stop", stopPending)
+            .setOnlyAlertOnce(true)
+
+        if (showProgress) {
+            builder.setProgress(100, percent, false)
+            builder.setContentText("$text — $percent%")
+        }
+        return builder.build()
+    }
+
+    private fun updateProfileNotification(profile: SyncProfile, text: String, percent: Int, showProgress: Boolean) {
+        notificationManager.notify(profileNotificationId(profile.id), buildProfileNotification(profile, text, percent, showProgress))
+    }
+
+    private fun profileNotificationId(profileId: String): Int = 1000 + (profileId.hashCode() and 0xFFFF)
+
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, "GitSync background sync", NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Shows live sync status and progress per profile"
+        }
+        notificationManager.createNotificationChannel(channel)
+    }
+
     override fun onDestroy() {
-        scheduled?.cancel(true)
-        scheduler.shutdownNow()
-        executor.shutdownNow()
         super.onDestroy()
+        loopJobs.values.forEach { it.cancel() }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        const val ACTION_START = "com.example.gitsync.action.START"
+        const val ACTION_STOP = "com.example.gitsync.action.STOP"
+        const val ACTION_TRIGGER_NOW = "com.example.gitsync.action.TRIGGER_NOW"
+        const val EXTRA_PROFILE_ID = "profile_id"
+        private const val CHANNEL_ID = "gitsync_channel"
+        private const val SUMMARY_NOTIFICATION_ID = 1
+
+        fun start(context: Context, profileId: String) {
+            val intent = Intent(context, SyncService::class.java).apply {
+                action = ACTION_START
+                putExtra(EXTRA_PROFILE_ID, profileId)
+            }
+            context.startForegroundService(intent)
+        }
+
+        fun stop(context: Context, profileId: String) {
+            val intent = Intent(context, SyncService::class.java).apply {
+                action = ACTION_STOP
+                putExtra(EXTRA_PROFILE_ID, profileId)
+            }
+            context.startService(intent)
+        }
+
+        fun triggerNow(context: Context, profileId: String) {
+            val intent = Intent(context, SyncService::class.java).apply {
+                action = ACTION_TRIGGER_NOW
+                putExtra(EXTRA_PROFILE_ID, profileId)
+            }
+            context.startForegroundService(intent)
+        }
+    }
 }

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GitSync</string>
+    <string name="accessibility_service_description">Detects when your selected apps open or close, so GitSync can trigger a sync automatically. GitSync does not read screen content.</string>
+</resources>
